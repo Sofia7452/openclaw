@@ -1,0 +1,21 @@
+{
+  "name": "my-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal Agent framework inspired by OpenClaw — context engineering, progressive skill disclosure, memory compaction",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo": "tsx src/demo.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  },
+  "dependencies": {
+    "openai": "^4.80.0"
+  }
+}
