@@ -9,6 +9,7 @@ import type {
 import { ContextBuilder, type ContextBuildResult } from "./context-builder.js";
 import type { PromptSection } from "./prompt/system-prompt.js";
 import type { MemoryCompactor } from "./memory/compaction.js";
+import type { LongTermMemory } from "./memory/long-term.js";
 
 /**
  * Agent — the ReAct (Reasoning + Acting) loop.
@@ -32,6 +33,14 @@ export interface AgentRunResult {
   totalTokens: number;
 }
 
+/** Callback fired after each iteration, useful for logging/debugging */
+export type OnStepCallback = (step: {
+  iteration: number;
+  toolCalls: ToolCall[];
+  toolResults: Array<{ name: string; result: string }>;
+  thinking: string | null;
+}) => void;
+
 export interface AgentOptions {
   config: AgentConfig;
   llm: LLMProvider;
@@ -40,6 +49,10 @@ export interface AgentOptions {
   extraSections?: PromptSection[];
   /** Optional compactor for LLM-based summarization (P1) */
   compactor?: MemoryCompactor;
+  /** Optional long-term memory for cross-session context (P2) */
+  memory?: LongTermMemory;
+  /** Optional step callback for debugging */
+  onStep?: OnStepCallback;
 }
 
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -50,17 +63,26 @@ export class Agent {
   private registry: ToolRegistry;
   private contextBuilder: ContextBuilder;
   private conversationHistory: Message[] = [];
+  private onStep?: OnStepCallback;
 
   constructor(options: AgentOptions) {
     this.config = options.config;
     this.llm = options.llm;
     this.registry = options.registry;
+    this.onStep = options.onStep;
+
+    // Automatically register the long-term memory tool if memory is provided
+    if (options.memory) {
+      this.registry.register(options.memory.createTool());
+    }
+
     this.contextBuilder = new ContextBuilder({
       config: options.config,
       registry: options.registry,
       skills: options.skills,
       extraSections: options.extraSections,
       compactor: options.compactor,
+      memory: options.memory,
     });
   }
 
@@ -82,30 +104,67 @@ export class Agent {
       const ctx = await this.contextBuilder.build(this.conversationHistory);
       totalTokens += ctx.tokenEstimate;
 
-      // If compaction happened, update history
       if (ctx.updatedHistory) {
         this.conversationHistory = ctx.updatedHistory;
       }
 
-      // 2. Call LLM
+      // 2. Determine if we should force a final answer
+      //    - Last 2 iterations: inject nudge + withhold tools
+      //    - This prevents models (especially DeepSeek) from endlessly exploring
+      const remainingSteps = maxIter - iterations;
+      const shouldForceAnswer = remainingSteps <= 0;
+      const shouldNudge = remainingSteps <= 1 && !shouldForceAnswer;
+
       const llmMessages: Message[] = [
         { role: "system", content: ctx.systemPrompt },
         ...ctx.messages,
       ];
-      const response = await this.llm.chat(llmMessages, ctx.tools);
 
-      // 3. Process response
-      if (response.toolCalls.length > 0) {
+      if (shouldNudge) {
+        llmMessages.push({
+          role: "system",
+          content:
+            "[IMPORTANT: This is your LAST chance to use tools. " +
+            "After this step, you MUST provide your final answer directly. " +
+            "If you already have enough information, respond NOW without calling tools.]",
+        });
+      }
+
+      if (shouldForceAnswer) {
+        // Replace the last system message with a hard stop instruction
+        llmMessages.push({
+          role: "system",
+          content:
+            "[FINAL STEP: You CANNOT call any tools. " +
+            "Based on ALL the information you have gathered in previous steps, " +
+            "provide your complete, well-structured answer NOW. " +
+            "Respond in the same language as the user's original question.]",
+        });
+      }
+
+      const response = await this.llm.chat(
+        llmMessages,
+        shouldForceAnswer ? [] : ctx.tools,
+      );
+
+      // 3. Process response — strip any fake tool-call markup from text-only responses
+      if (response.toolCalls.length > 0 && !shouldForceAnswer) {
         // Reasoning + Acting: record assistant message with tool calls
-        this.conversationHistory.push({
+        const assistantMsg: Message = {
           role: "assistant",
           content: response.content,
           tool_calls: response.toolCalls,
-        });
+        };
+        if (response.reasoningContent) {
+          assistantMsg.reasoning_content = response.reasoningContent;
+        }
+        this.conversationHistory.push(assistantMsg);
 
         // Execute each tool call and record results
+        const toolResults: Array<{ name: string; result: string }> = [];
         for (const tc of response.toolCalls) {
           const result = await this.registry.execute(tc.name, tc.arguments);
+          toolResults.push({ name: tc.name, result });
           this.conversationHistory.push({
             role: "tool",
             content: result,
@@ -113,14 +172,32 @@ export class Agent {
             name: tc.name,
           });
         }
+
+        // Fire step callback
+        this.onStep?.({
+          iteration: iterations,
+          toolCalls: response.toolCalls,
+          toolResults,
+          thinking: response.content,
+        });
+
         // Loop back for the next reasoning step
       } else {
         // Final answer — no more tool calls
-        const finalContent = response.content ?? "";
-        this.conversationHistory.push({
+        let finalContent = response.content ?? "";
+
+        // Some models (DeepSeek) may embed fake tool-call markup in plain text
+        // when tools are withheld. Strip it to get a clean answer.
+        finalContent = stripFakeToolCalls(finalContent);
+
+        const finalMsg: Message = {
           role: "assistant",
           content: finalContent,
-        });
+        };
+        if (response.reasoningContent) {
+          finalMsg.reasoning_content = response.reasoningContent;
+        }
+        this.conversationHistory.push(finalMsg);
 
         return {
           response: finalContent,
@@ -131,10 +208,12 @@ export class Agent {
       }
     }
 
-    // Safety: max iterations reached
-    const fallback =
-      "I've reached the maximum number of reasoning steps. " +
-      "Here's what I have so far based on the tools I've used.";
+    // Safety: max iterations reached — extract last assistant content as best-effort
+    const lastAssistant = [...this.conversationHistory]
+      .reverse()
+      .find((m) => m.role === "assistant" && m.content);
+    const fallback = lastAssistant?.content ??
+      "I've reached the maximum number of reasoning steps.";
     this.conversationHistory.push({
       role: "assistant",
       content: fallback,
@@ -162,4 +241,20 @@ export class Agent {
   getContextBuilder(): ContextBuilder {
     return this.contextBuilder;
   }
+}
+
+/**
+ * Strip fake tool-call markup that some models (DeepSeek) emit in plain text
+ * when tools are withheld. Patterns include:
+ *   <｜DSML｜function_calls>...</｜DSML｜function_calls>
+ *   ```tool_code\n...\n```
+ */
+function stripFakeToolCalls(text: string): string {
+  // DeepSeek DSML markup
+  let cleaned = text.replace(/<｜DSML｜[\s\S]*$/g, "");
+  // Generic XML-like tool blocks
+  cleaned = cleaned.replace(/<function_call>[\s\S]*?<\/function_call>/g, "");
+  // Markdown tool_code blocks
+  cleaned = cleaned.replace(/```tool_code[\s\S]*?```/g, "");
+  return cleaned.trim();
 }

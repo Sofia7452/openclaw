@@ -115,17 +115,25 @@ describe("Agent — ReAct loop", () => {
   });
 
   it("stops at maxIterations to prevent runaway loops", async () => {
-    // LLM always returns tool calls — never stops
-    const infiniteToolCalls: LLMResponse = {
+    // LLM always returns tool calls for the first N-1 calls,
+    // then on the last call (no tools passed) returns a text answer
+    const toolCallResponse: LLMResponse = {
       content: "thinking...",
       toolCalls: [
         { id: "loop", name: "calculator", arguments: '{"expression":"1+1"}' },
       ],
       finishReason: "tool_calls",
     };
-    const llm = new MockLLMProvider(
-      Array.from({ length: 20 }, () => infiniteToolCalls),
-    );
+    const finalResponse: LLMResponse = {
+      content: "Here is my best answer so far.",
+      toolCalls: [],
+      finishReason: "stop",
+    };
+    const llm = new MockLLMProvider([
+      toolCallResponse, // iter 1
+      toolCallResponse, // iter 2 (also injects nudge for iter 2 = maxIter-1)
+      finalResponse,    // iter 3 (last iteration, no tools passed → text only)
+    ]);
     const agent = new Agent({
       config: { ...config, maxIterations: 3 },
       llm,
@@ -135,7 +143,8 @@ describe("Agent — ReAct loop", () => {
     const result = await agent.run("Loop forever");
 
     expect(result.iterations).toBe(3);
-    expect(result.response).toContain("maximum number of reasoning steps");
+    // On the last iteration, tools are withheld so LLM must give a text answer
+    expect(result.response).toBe("Here is my best answer so far.");
   });
 
   it("handles unknown tool gracefully", async () => {

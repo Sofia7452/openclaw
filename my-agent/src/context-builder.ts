@@ -11,6 +11,7 @@ import {
 } from "./prompt/system-prompt.js";
 import type { ToolRegistry } from "./tools/registry.js";
 import type { MemoryCompactor } from "./memory/compaction.js";
+import type { LongTermMemory } from "./memory/long-term.js";
 
 /**
  * ContextBuilder — the "chief of staff" behind the agent.
@@ -45,6 +46,8 @@ export interface ContextBuilderOptions {
   extraSections?: PromptSection[];
   /** Optional compactor for LLM-based summarization */
   compactor?: MemoryCompactor;
+  /** Optional long-term memory for cross-session context */
+  memory?: LongTermMemory;
 }
 
 const DEFAULT_MAX_CONTEXT_TOKENS = 32_000;
@@ -56,6 +59,7 @@ export class ContextBuilder {
   private maxContextTokens: number;
   private extraSections: PromptSection[];
   private compactor?: MemoryCompactor;
+  private memory?: LongTermMemory;
 
   constructor(options: ContextBuilderOptions) {
     this.config = options.config;
@@ -65,6 +69,7 @@ export class ContextBuilder {
       options.maxContextTokens ?? DEFAULT_MAX_CONTEXT_TOKENS;
     this.extraSections = options.extraSections ?? [];
     this.compactor = options.compactor;
+    this.memory = options.memory;
   }
 
   /**
@@ -84,13 +89,23 @@ export class ContextBuilder {
       this.config.toolAllowlist,
     );
 
+    // --- READ: pull from long-term memory (P2) ---
+    const memoryContent = this.memory ? await this.memory.read() : "";
+    const effectiveExtraSections = [...this.extraSections];
+    if (memoryContent) {
+      effectiveExtraSections.push({
+        heading: "Long-Term Memory",
+        content: memoryContent,
+      });
+    }
+
     // --- BUILD: assemble system prompt ---
     const systemPrompt = buildSystemPrompt({
       config: this.config,
       tools,
       skills: this.skills.length > 0 ? this.skills : undefined,
       extraSections:
-        this.extraSections.length > 0 ? this.extraSections : undefined,
+        effectiveExtraSections.length > 0 ? effectiveExtraSections : undefined,
     });
 
     const systemTokens = estimateTokens(systemPrompt);

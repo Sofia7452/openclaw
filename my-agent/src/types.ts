@@ -24,6 +24,8 @@ export interface Message {
   /** Present when role === "tool" — links back to the originating tool_call id */
   tool_call_id?: string;
   name?: string;
+  /** Reasoning/thinking content from models with thinking mode (e.g. Kimi K2.5) */
+  reasoning_content?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,8 @@ export interface LLMResponse {
   content: string | null;
   toolCalls: ToolCall[];
   finishReason: "stop" | "tool_calls" | "length" | "content_filter";
+  /** Reasoning/thinking content from models with thinking mode (e.g. Kimi K2.5) */
+  reasoningContent?: string;
 }
 
 export interface LLMProvider {
