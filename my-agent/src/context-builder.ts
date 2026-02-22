@@ -10,6 +10,7 @@ import {
   type PromptSection,
 } from "./prompt/system-prompt.js";
 import type { ToolRegistry } from "./tools/registry.js";
+import type { MemoryCompactor } from "./memory/compaction.js";
 
 /**
  * ContextBuilder — the "chief of staff" behind the agent.
@@ -30,6 +31,8 @@ export interface ContextBuildResult {
   messages: Message[];
   tools: ToolDefinition[];
   tokenEstimate: number;
+  /** If compaction happened, this is the updated history */
+  updatedHistory?: Message[];
 }
 
 export interface ContextBuilderOptions {
@@ -40,6 +43,8 @@ export interface ContextBuilderOptions {
   maxContextTokens?: number;
   /** Extra sections to inject (workspace info, memory snippets, etc.) */
   extraSections?: PromptSection[];
+  /** Optional compactor for LLM-based summarization */
+  compactor?: MemoryCompactor;
 }
 
 const DEFAULT_MAX_CONTEXT_TOKENS = 32_000;
@@ -50,6 +55,7 @@ export class ContextBuilder {
   private skills: SkillMeta[];
   private maxContextTokens: number;
   private extraSections: PromptSection[];
+  private compactor?: MemoryCompactor;
 
   constructor(options: ContextBuilderOptions) {
     this.config = options.config;
@@ -58,6 +64,7 @@ export class ContextBuilder {
     this.maxContextTokens =
       options.maxContextTokens ?? DEFAULT_MAX_CONTEXT_TOKENS;
     this.extraSections = options.extraSections ?? [];
+    this.compactor = options.compactor;
   }
 
   /**
@@ -66,10 +73,12 @@ export class ContextBuilder {
    * Strategy:
    * 1. SELECT tools via allowlist
    * 2. BUILD system prompt from config + tools + skills + extras
-   * 3. COMPRESS message history if over budget (tail-pruning at P0)
+   * 3. COMPRESS message history if over budget
+   *    - Uses LLM-based compaction if compactor is available
+   *    - Falls back to tail-pruning
    * 4. Return assembled context
    */
-  build(conversationHistory: Message[]): ContextBuildResult {
+  async build(conversationHistory: Message[]): Promise<ContextBuildResult> {
     // --- SELECT: filter tools by allowlist ---
     const tools = this.registry.filteredDefinitions(
       this.config.toolAllowlist,
@@ -84,10 +93,26 @@ export class ContextBuilder {
         this.extraSections.length > 0 ? this.extraSections : undefined,
     });
 
-    // --- COMPRESS: prune messages if over budget ---
     const systemTokens = estimateTokens(systemPrompt);
     const budget = this.maxContextTokens - systemTokens;
-    const messages = this.pruneMessages(conversationHistory, budget);
+
+    let messages = conversationHistory;
+    let updatedHistory: Message[] | undefined;
+
+    // --- COMPRESS: LLM-based compaction (P1) ---
+    if (this.compactor && this.compactor.shouldCompact(messages, budget)) {
+      const result = await this.compactor.compact(messages);
+      if (result) {
+        messages = result.messages;
+        updatedHistory = messages;
+      }
+    }
+
+    // --- COMPRESS: Fallback to tail-pruning (P0) ---
+    const prunedMessages = this.pruneMessages(messages, budget);
+    if (prunedMessages.length !== messages.length) {
+      messages = prunedMessages;
+    }
 
     const totalTokens =
       systemTokens + messages.reduce((s, m) => s + estimateTokens(m.content ?? ""), 0);
@@ -97,6 +122,7 @@ export class ContextBuilder {
       messages,
       tools,
       tokenEstimate: totalTokens,
+      updatedHistory,
     };
   }
 

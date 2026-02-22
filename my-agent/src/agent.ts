@@ -6,9 +6,9 @@ import type {
   SkillMeta,
   ToolCall,
 } from "./types.js";
-import { ToolRegistry } from "./tools/registry.js";
 import { ContextBuilder, type ContextBuildResult } from "./context-builder.js";
 import type { PromptSection } from "./prompt/system-prompt.js";
+import type { MemoryCompactor } from "./memory/compaction.js";
 
 /**
  * Agent — the ReAct (Reasoning + Acting) loop.
@@ -38,6 +38,8 @@ export interface AgentOptions {
   registry: ToolRegistry;
   skills?: SkillMeta[];
   extraSections?: PromptSection[];
+  /** Optional compactor for LLM-based summarization (P1) */
+  compactor?: MemoryCompactor;
 }
 
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -58,6 +60,7 @@ export class Agent {
       registry: options.registry,
       skills: options.skills,
       extraSections: options.extraSections,
+      compactor: options.compactor,
     });
   }
 
@@ -76,8 +79,13 @@ export class Agent {
       iterations++;
 
       // 1. Build context
-      const ctx = this.contextBuilder.build(this.conversationHistory);
+      const ctx = await this.contextBuilder.build(this.conversationHistory);
       totalTokens += ctx.tokenEstimate;
+
+      // If compaction happened, update history
+      if (ctx.updatedHistory) {
+        this.conversationHistory = ctx.updatedHistory;
+      }
 
       // 2. Call LLM
       const llmMessages: Message[] = [

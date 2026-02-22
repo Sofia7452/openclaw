@@ -35,7 +35,7 @@ const config: AgentConfig = {
 };
 
 describe("ContextBuilder", () => {
-  it("builds context with system prompt and messages", () => {
+  it("builds context with system prompt and messages", async () => {
     const builder = new ContextBuilder({
       config,
       registry: makeRegistry(),
@@ -44,7 +44,7 @@ describe("ContextBuilder", () => {
       { role: "user", content: "Hello" },
       { role: "assistant", content: "Hi there" },
     ];
-    const result = builder.build(history);
+    const result = await builder.build(history);
 
     expect(result.systemPrompt).toContain("You are a test agent.");
     expect(result.systemPrompt).toContain("tool_a");
@@ -53,7 +53,7 @@ describe("ContextBuilder", () => {
     expect(result.tokenEstimate).toBeGreaterThan(0);
   });
 
-  it("filters tools by allowlist", () => {
+  it("filters tools by allowlist", async () => {
     const configWithAllowlist: AgentConfig = {
       ...config,
       toolAllowlist: ["tool_a"],
@@ -62,7 +62,7 @@ describe("ContextBuilder", () => {
       config: configWithAllowlist,
       registry: makeRegistry(),
     });
-    const result = builder.build([]);
+    const result = await builder.build([]);
 
     expect(result.tools).toHaveLength(1);
     expect(result.tools[0].name).toBe("tool_a");
@@ -70,7 +70,7 @@ describe("ContextBuilder", () => {
     expect(result.systemPrompt).not.toContain("tool_b");
   });
 
-  it("prunes old messages when over token budget", () => {
+  it("prunes old messages when over token budget", async () => {
     const builder = new ContextBuilder({
       config,
       registry: makeRegistry(),
@@ -83,7 +83,7 @@ describe("ContextBuilder", () => {
       content: `Message number ${i} with some padding text to consume tokens. `.repeat(3),
     }));
 
-    const result = builder.build(history);
+    const result = await builder.build(history);
 
     // Should have fewer messages than original
     expect(result.messages.length).toBeLessThan(history.length);
@@ -93,7 +93,7 @@ describe("ContextBuilder", () => {
     expect(result.messages[result.messages.length - 1].content).toContain("Message number 49");
   });
 
-  it("preserves all messages when within budget", () => {
+  it("preserves all messages when within budget", async () => {
     const builder = new ContextBuilder({
       config,
       registry: makeRegistry(),
@@ -103,11 +103,11 @@ describe("ContextBuilder", () => {
       { role: "user", content: "short" },
       { role: "assistant", content: "reply" },
     ];
-    const result = builder.build(history);
+    const result = await builder.build(history);
     expect(result.messages).toHaveLength(2);
   });
 
-  it("includes skills metadata in system prompt", () => {
+  it("includes skills metadata in system prompt", async () => {
     const builder = new ContextBuilder({
       config,
       registry: makeRegistry(),
@@ -120,19 +120,73 @@ describe("ContextBuilder", () => {
         },
       ],
     });
-    const result = builder.build([]);
+    const result = await builder.build([]);
     expect(result.systemPrompt).toContain("Available Skills");
     expect(result.systemPrompt).toContain("test-skill");
   });
 
-  it("supports adding extra sections dynamically", () => {
+  it("supports adding extra sections dynamically", async () => {
     const builder = new ContextBuilder({
       config,
       registry: makeRegistry(),
     });
     builder.addSection({ heading: "Memory", content: "User prefers dark mode." });
-    const result = builder.build([]);
+    const result = await builder.build([]);
     expect(result.systemPrompt).toContain("## Memory");
     expect(result.systemPrompt).toContain("User prefers dark mode.");
+  });
+});
+
+import { MemoryCompactor } from "./memory/compaction.js";
+import { MockLLMProvider } from "./llm/mock-provider.js";
+
+describe("ContextBuilder with MemoryCompactor", () => {
+  it("uses compactor when budget is exceeded", async () => {
+    const mockLlm = new MockLLMProvider([
+      { content: "Summary of the conversation.", toolCalls: [], finishReason: "stop" },
+    ]);
+    const compactor = new MemoryCompactor({
+      llm: mockLlm,
+      keepRecentCount: 2,
+    });
+
+    const builder = new ContextBuilder({
+      config,
+      registry: makeRegistry(),
+      compactor,
+      maxContextTokens: 500, // Trigger compaction
+    });
+
+    const history: Message[] = Array.from({ length: 10 }, (_, i) => ({
+      role: (i % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+      content: `Turn ${i} with long text to fill budget. `.repeat(5),
+    }));
+
+    const result = await builder.build(history);
+
+    expect(result.updatedHistory).toBeDefined();
+    expect(result.messages[0].content).toContain("Context summary:");
+    expect(result.messages[0].content).toContain("Summary of the conversation.");
+    // 1 summary msg + 2 recent msgs
+    expect(result.messages).toHaveLength(3);
+    expect(mockLlm.calls).toHaveLength(1);
+    expect(mockLlm.calls[0].messages[0].content).toContain("provide a concise, factual summary");
+  });
+
+  it("skips compaction if budget is not reached", async () => {
+    const mockLlm = new MockLLMProvider([]);
+    const compactor = new MemoryCompactor({ llm: mockLlm });
+    const builder = new ContextBuilder({
+      config,
+      registry: makeRegistry(),
+      compactor,
+      maxContextTokens: 100_000,
+    });
+
+    const history: Message[] = [{ role: "user", content: "short" }];
+    const result = await builder.build(history);
+
+    expect(result.updatedHistory).toBeUndefined();
+    expect(mockLlm.calls).toHaveLength(0);
   });
 });
