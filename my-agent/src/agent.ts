@@ -47,6 +47,8 @@ export interface AgentOptions {
   registry: ToolRegistry;
   skills?: SkillMeta[];
   extraSections?: PromptSection[];
+  /** Optional max context token budget for ContextBuilder */
+  maxContextTokens?: number;
   /** Optional compactor for LLM-based summarization (P1) */
   compactor?: MemoryCompactor;
   /** Optional long-term memory for cross-session context (P2) */
@@ -80,6 +82,7 @@ export class Agent {
       config: options.config,
       registry: options.registry,
       skills: options.skills,
+      maxContextTokens: options.maxContextTokens,
       extraSections: options.extraSections,
       compactor: options.compactor,
       memory: options.memory,
